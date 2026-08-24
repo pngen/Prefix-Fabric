@@ -1,0 +1,25 @@
+add_executable(test_core test_core.cpp)
+target_link_libraries(test_core PRIVATE prefix_fabric)
+pf_set_warnings(test_core)
+add_test(NAME core COMMAND test_core)
+
+add_executable(test_prop test_prop.cpp)
+target_link_libraries(test_prop PRIVATE prefix_fabric)
+pf_set_warnings(test_prop)
+add_test(NAME prop COMMAND test_prop)
+
+add_executable(test_concurrency test_concurrency.cpp)
+target_link_libraries(test_concurrency PRIVATE prefix_fabric)
+pf_set_warnings(test_concurrency)
+add_test(NAME concurrency COMMAND test_concurrency)
+
+add_executable(test_persist test_persist.cpp)
+target_link_libraries(test_persist PRIVATE prefix_fabric)
+pf_set_warnings(test_persist)
+add_test(NAME pers COMMAND test_persist)
+
+add_executable(test_distributed test_distributed.cpp)
+target_link_libraries(test_distributed PRIVATE prefix_fabric)
+target_compile_definitions(test_distributed PRIVATE PF_CLI_EXE="$<TARGET_FILE:prefix-fabric>")
+pf_set_warnings(test_distributed)
+add_test(NAME distributed COMMAND test_distributed)

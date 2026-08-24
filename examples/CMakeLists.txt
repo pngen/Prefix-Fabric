@@ -1,0 +1,14 @@
+add_executable(example_basic example_basic.cpp)
+target_link_libraries(example_basic PRIVATE prefix_fabric)
+pf_set_warnings(example_basic)
+add_test(NAME example_basic COMMAND example_basic)
+
+add_executable(example_persistence example_persistence.cpp)
+target_link_libraries(example_persistence PRIVATE prefix_fabric)
+pf_set_warnings(example_persistence)
+add_test(NAME example_persistence COMMAND example_persistence)
+
+add_executable(example_distributed example_distributed.cpp)
+target_link_libraries(example_distributed PRIVATE prefix_fabric)
+pf_set_warnings(example_distributed)
+add_test(NAME example_distributed COMMAND example_distributed)
