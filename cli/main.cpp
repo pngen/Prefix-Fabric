@@ -168,6 +168,26 @@ int main(int argc, char** argv) {
     std::printf("%s\n", r.is_ok() ? "OK" : r.error().ToString().c_str());
     save(); return 0;
   }
+  if (cmd == "attach-state") {
+    std::string idh, ns, oid; std::uint64_t gen = 1;
+    for (std::size_t i = 0; i + 1 < a.size(); ++i) { if (a[i] == "--id") idh = a[i+1]; else if (a[i] == "--ns") ns = a[i+1]; else if (a[i] == "--object") oid = a[i+1]; else if (a[i] == "--gen") gen = std::stoull(a[i+1]); }
+    auto id = PrefixId::Parse(idh);
+    if (id.is_err() || ns.empty() || oid.empty()) { std::printf("attach-state needs --id --ns --object\n"); return 1; }
+    StateReference ref; ref.ns = ns; ref.object_id = oid; ref.generation = gen; ref.type = StateReference::Type::kKvFabric; ref.compatibility = compat; ref.freshness_ts = 1;
+    auto r = store.AttachState(id.value(), ref);
+    std::printf("%s attached=%zu\n", r.is_ok() ? "OK" : r.error().ToString().c_str(), r.is_ok() ? r.value().size() : 0u);
+    save(); return 0;
+  }
+  if (cmd == "retire-state") {
+    std::string idh, ns, oid;
+    for (std::size_t i = 0; i + 1 < a.size(); ++i) { if (a[i] == "--id") idh = a[i+1]; else if (a[i] == "--ns") ns = a[i+1]; else if (a[i] == "--object") oid = a[i+1]; }
+    auto id = PrefixId::Parse(idh);
+    if (id.is_err() || ns.empty() || oid.empty()) { std::printf("retire-state needs --id --ns --object\n"); return 1; }
+    StateReference ref; ref.ns = ns; ref.object_id = oid; ref.compatibility = compat;
+    auto r = store.RetireState(id.value(), ref);
+    std::printf("%s\n", r.is_ok() ? "OK" : r.error().ToString().c_str());
+    save(); return 0;
+  }
   if (cmd == "snapshot") {
     auto sn = store.Snapshot();
     std::printf("snapshot records=%llu segments=%llu tokens=%llu refs=%llu\n", (unsigned long long)sn.prefix_count, (unsigned long long)sn.segment_count, (unsigned long long)sn.token_count, (unsigned long long)sn.state_reference_count);
