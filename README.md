@@ -188,4 +188,4 @@ CMake options that gate optional targets are `PREFIX_FABRIC_BUILD_TESTS`, `PREFI
 
 ## License
 
-Apache-2.0. Copyright 2026 Summon Software Labs.
+Apache License 2.0. Copyright 2026 Summon Software Labs. No telemetry transmission.
