@@ -4,11 +4,11 @@ Thank you for contributing to Prefix Fabric. This document covers how to build, 
 
 ## Set up your git identity
 
-All commits should be attributed to the canonical project identity. Configure it once:
+Commit under your own configured Git identity so your work is attributed to you. If you have not set one yet:
 
 ```sh
-git config user.name pngen
-git config user.email pngen93@gmail.com
+git config user.name "Your Name"
+git config user.email "you@example.com"
 ```
 
 ## Prerequisites
@@ -132,7 +132,7 @@ Use this checklist for a `1.0.x` release.
 6. **Install and consume.** Run `cmake --install build --config Release --prefix <install-dir>`, then build a small downstream consumer that uses `find_package(prefix_fabric CONFIG REQUIRED)` and links `prefix_fabric::prefix_fabric`.
 7. **No generated garbage.** Confirm `git status` is clean of build artifacts and that `.gitignore` still covers everything. Remove any stray generated files.
 8. **Docs and changelog.** Review `README.md`, `docs/DESIGN.md`, and `CONTRIBUTING.md` for accuracy against the released behavior. Note any API additions.
-9. **Commit.** Commit with the canonical git identity (`pngen` / `pngen93@gmail.com`) and a descriptive message.
+9. **Commit.** Commit under your own configured git identity with a descriptive message.
 10. **Tag and sign.** Tag the release (for example `v1.0.0`) and, if your workflow uses them, sign the tag.
 11. **Verify the release artifacts.** Confirm the install layout exposes `include/prefix_fabric`, the library, and `prefix_fabricConfig.cmake` under the CMake package directory.
 
