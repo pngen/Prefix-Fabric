@@ -30,7 +30,9 @@ struct PrefixCoordinator::Impl {
   std::vector<std::thread> handlers;
   std::uint64_t max_frame = 32 * 1024 * 1024;
 
-  explicit Impl(const Options& o) : opts(o), store(PrefixStore::Options{o.ns, o.default_compat, o.segmentation, o.capacity, o.eviction}) {}
+  explicit Impl(const Options& o) : opts(o), store(PrefixStore::Options{o.ns, o.default_compat, o.segmentation, o.capacity, o.eviction}) {
+    max_frame = store.Capacity().max_network_frame_bytes;  // the configured frame bound
+  }
 
   bool IsRegistered(const std::string& boot_id) {
     std::lock_guard<std::mutex> lk(nodes_mtx);
@@ -67,6 +69,7 @@ Result<std::uint16_t> PrefixCoordinator::Start() {
       auto* I2 = I;
       I->handlers.emplace_back([I2, c = std::move(c)]() mutable {
         TcpConnection conn = std::move(c);
+        const SOCKET mine = conn.NativeHandle();
         for (;;) {
           if (I2->stop.load()) break;
           auto frame = conn.RecvFrame(I2->max_frame);
@@ -138,10 +141,13 @@ Result<std::uint16_t> PrefixCoordinator::Start() {
           }
           if (conn.SendFrame(reply).is_err()) break;
         }
-        conn.Close();
+        // Leave the live list first, then close: a handle in that list is always one
+        // this thread still owns, so Stop() never touches a handle value that was
+        // closed here and has since been given to another socket.
         { std::lock_guard<std::mutex> lk(I2->conn_mtx);
-          for (std::size_t i = 0; i < I2->live_conns.size(); ++i) if (I2->live_conns[i] == conn.NativeHandle()) { I2->live_conns.erase(I2->live_conns.begin() + static_cast<std::ptrdiff_t>(i)); break; }
+          for (std::size_t i = 0; i < I2->live_conns.size(); ++i) if (I2->live_conns[i] == mine) { I2->live_conns.erase(I2->live_conns.begin() + static_cast<std::ptrdiff_t>(i)); break; }
         }
+        conn.Close();
       });
     }
   });
@@ -154,9 +160,13 @@ void PrefixCoordinator::Stop() {
   I->listener.Close();
   if (I->accept_thread.joinable()) I->accept_thread.join();
   {
+    // Wake the handlers; each one closes its own socket exactly once.
     std::lock_guard<std::mutex> lk(I->conn_mtx);
-    for (SOCKET s : I->live_conns) closesocket(s);
-    I->live_conns.clear();
+#ifdef _WIN32
+    for (SOCKET s : I->live_conns) shutdown(s, SD_BOTH);
+#else
+    for (SOCKET s : I->live_conns) shutdown(s, SHUT_RDWR);
+#endif
   }
   for (auto& h : I->handlers) if (h.joinable()) h.join();
   I->handlers.clear();

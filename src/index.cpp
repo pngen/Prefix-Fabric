@@ -235,8 +235,78 @@ struct PrefixIndex::Impl {
   std::atomic<std::uint64_t> g_prefixes_{0}, g_segments_{0}, g_refs_{0},
       g_nodes_{0}, g_tokens_{0}, g_footprint_{0};
 
+  struct Counts {
+    std::uint64_t prefixes = 0, nodes = 0, segments = 0, refs = 0, tokens = 0, footprint = 0;
+  };
+
   explicit Impl(const IndexConfig& c) : cfg(c) {
-    if (cfg.capacity.max_network_frame_bytes == 0) cfg.capacity = CapacityPolicy::Defaults();
+    // A zero bound means "the default bound" (policy.hpp), never "nothing is allowed".
+    const CapacityPolicy d = CapacityPolicy::Defaults();
+    CapacityPolicy& p = cfg.capacity;
+    if (p.max_prefixes == 0) p.max_prefixes = d.max_prefixes;
+    if (p.max_segments == 0) p.max_segments = d.max_segments;
+    if (p.max_token_index_footprint == 0) p.max_token_index_footprint = d.max_token_index_footprint;
+    if (p.max_state_references == 0) p.max_state_references = d.max_state_references;
+    if (p.max_nodes_total == 0) p.max_nodes_total = d.max_nodes_total;
+    if (p.max_serialized_object_bytes == 0) p.max_serialized_object_bytes = d.max_serialized_object_bytes;
+    if (p.max_network_frame_bytes == 0) p.max_network_frame_bytes = d.max_network_frame_bytes;
+    if (p.max_subscriptions == 0) p.max_subscriptions = d.max_subscriptions;
+    if (p.max_event_backlog == 0) p.max_event_backlog = d.max_event_backlog;
+  }
+
+  // --- counters ---
+  static Counts CountsOf(const Trie* t) {
+    Counts c;
+    if (t) {
+      c.prefixes = t->prefixes; c.nodes = t->nodes; c.segments = t->segments;
+      c.refs = t->refs; c.tokens = t->tokens; c.footprint = t->footprint;
+    }
+    return c;
+  }
+  // The global counters follow the per-trie counters by exact differences, so no
+  // operation overwrites them with a sum that was taken at another moment. `held`
+  // is what Reserve() already added for this change. Unsigned wrap-around makes a
+  // shrinking difference a subtraction.
+  void Settle(const Counts& before, const Counts& held, const Counts& after) {
+    g_prefixes_ += after.prefixes - before.prefixes - held.prefixes;
+    g_nodes_ += after.nodes - before.nodes - held.nodes;
+    g_segments_ += after.segments - before.segments - held.segments;
+    g_refs_ += after.refs - before.refs - held.refs;
+    g_tokens_ += after.tokens - before.tokens - held.tokens;
+    g_footprint_ += after.footprint - before.footprint - held.footprint;
+  }
+  static bool TryAdd(std::atomic<std::uint64_t>& c, std::uint64_t add, std::uint64_t limit) {
+    if (add == 0) return true;
+    std::uint64_t cur = c.load();
+    for (;;) {
+      if (add > limit || cur > limit - add) return false;
+      if (c.compare_exchange_weak(cur, cur + add)) return true;
+    }
+  }
+  // Take room for `plan` under the hard bounds, all or nothing. Returns the bound
+  // that is full, or nullptr when the room is held.
+  const char* Reserve(const Counts& plan) {
+    const CapacityPolicy& cap = cfg.capacity;
+    if (!TryAdd(g_prefixes_, plan.prefixes, cap.max_prefixes)) return "prefix capacity reached";
+    if (!TryAdd(g_nodes_, plan.nodes, cap.max_nodes_total)) {
+      g_prefixes_ -= plan.prefixes;
+      return "node capacity reached";
+    }
+    if (!TryAdd(g_segments_, plan.segments, cap.max_segments)) {
+      g_prefixes_ -= plan.prefixes; g_nodes_ -= plan.nodes;
+      return "segment capacity reached";
+    }
+    if (!TryAdd(g_refs_, plan.refs, cap.max_state_references)) {
+      g_prefixes_ -= plan.prefixes; g_nodes_ -= plan.nodes; g_segments_ -= plan.segments;
+      return "reference capacity reached";
+    }
+    if (!TryAdd(g_tokens_, plan.tokens, cap.max_token_index_footprint / 4u)) {
+      g_prefixes_ -= plan.prefixes; g_nodes_ -= plan.nodes; g_segments_ -= plan.segments;
+      g_refs_ -= plan.refs;
+      return "token capacity reached";
+    }
+    g_footprint_ += plan.footprint;
+    return nullptr;
   }
 
   std::size_t ShardIndex(const std::string& key) const {
@@ -328,36 +398,107 @@ struct PrefixIndex::Impl {
     children.insert(it, std::move(c));
   }
 
-  void AddStateRefs(Trie* t, TreeNode* n, const std::vector<StateReference>& refs) {
+  // The number of segments ComputeSegmentsFor produces for a prefix of n tokens.
+  std::uint64_t SegmentCountFor(std::uint64_t n) const {
+    if (n == 0 || cfg.segmentation.policy == SegmentationPolicy::kSingle) return 1;
+    std::uint64_t sz = 1;
+    if (cfg.segmentation.policy == SegmentationPolicy::kFixed)
+      sz = cfg.segmentation.fixed_size == 0 ? 1 : cfg.segmentation.fixed_size;
+    else if (cfg.segmentation.policy == SegmentationPolicy::kAdaptive)
+      sz = cfg.segmentation.target_size == 0 ? 256 : cfg.segmentation.target_size;
+    return n / sz + (n % sz ? 1 : 0);
+  }
+
+  static bool IsStale(const StateReference& r) { return r.freshness_ts && *r.freshness_ts == 0; }
+
+  // How many of `refs` would become new attachments on a node that holds `have`.
+  static std::uint64_t NewRefCount(const std::vector<StateReference>* have,
+                                   const std::vector<StateReference>& refs) {
+    std::uint64_t n = 0;
+    std::vector<std::string> seen;
     for (const auto& r : refs) {
       if (!r.IsWellFormed()) continue;
-      bool present = false;
-      for (auto& e : n->state_refs) if (e.Key() == r.Key()) { present = true; break; }
-      if (!present) { n->state_refs.push_back(r); ++t->refs; }
+      const std::string k = r.Key();
+      bool present = std::find(seen.begin(), seen.end(), k) != seen.end();
+      if (!present && have)
+        for (const auto& e : *have) if (e.Key() == k) { present = true; break; }
+      if (!present) { seen.push_back(k); ++n; }
+    }
+    return n;
+  }
+
+  // What TrieInsert would add for these tokens: the same walk, nothing changed.
+  Counts PlanInsert(const Trie* t, const TokenSequence& tokens,
+                    const std::vector<StateReference>& refs) const {
+    Counts d;
+    if (!t) d.nodes += 1;  // the root of a new trie
+    if (tokens.empty()) return d;
+    const std::uint64_t n = tokens.size();
+    auto leaf = [&](std::uint64_t edge_len) {
+      d.nodes += 1; d.prefixes += 1; d.segments += SegmentCountFor(n); d.tokens += n;
+      d.footprint += 4u * edge_len; d.refs += NewRefCount(nullptr, refs);
+    };
+    if (!t) { leaf(n); return d; }
+    const TreeNode* node = t->root.get();
+    std::size_t i = 0;
+    for (;;) {
+      if (i == tokens.size()) {  // the prefix is already a node
+        if (node->active) {
+          d.refs += NewRefCount(&node->state_refs, refs);
+        } else {
+          const std::uint64_t fresh = NewRefCount(nullptr, refs);
+          if (fresh > node->state_refs.size()) d.refs += fresh - node->state_refs.size();
+        }
+        const std::uint64_t segs = SegmentCountFor(node->token_count);
+        if (segs > node->segments.size()) d.segments += segs - node->segments.size();
+        return d;
+      }
+      const TreeNode* child = nullptr;
+      for (auto& c : node->children) if (EdgeStartsWith(c->edge, tokens[i])) { child = c.get(); break; }
+      if (!child) { leaf(n - i); return d; }
+      const std::size_t lcp = CommonPrefix(child->edge, 0, tokens, i);
+      if (lcp == child->edge.size()) { node = child; i += lcp; continue; }
+      const std::uint64_t len = i + lcp;  // a split node for the shared part
+      d.nodes += 1; d.prefixes += 1; d.segments += SegmentCountFor(len); d.tokens += len;
+      if (len == n) { d.refs += NewRefCount(nullptr, refs); return d; }
+      leaf(n - len);
+      return d;
     }
   }
 
+  // Attach `r` to `n`. A reference to an object that is already attached is the
+  // same attachment: a newer generation replaces it (so does the same generation
+  // when the attached one was marked stale), an older generation is refused.
+  bool AttachRef(Trie* t, TreeNode* n, const StateReference& r) {
+    for (auto& e : n->state_refs) {
+      if (e.Key() != r.Key()) continue;
+      if (r.generation < e.generation) return false;
+      if (r.generation > e.generation || IsStale(e)) e = r;
+      return true;
+    }
+    n->state_refs.push_back(r);
+    ++t->refs;
+    return true;
+  }
+
+  void AddStateRefs(Trie* t, TreeNode* n, const std::vector<StateReference>& refs) {
+    for (const auto& r : refs) if (r.IsWellFormed()) AttachRef(t, n, r);
+  }
+
+  // Per-trie counters only; the caller settles the global ones.
   void FinalizeNew(Trie* t, TreeNode* n, const std::vector<StateReference>& refs,
                    const std::string& provenance, std::size_t shard) {
     n->provenance = provenance;
     RefreshIdentity(t, n);
     n->segments = ComputeSegmentsFor(t->compat, Full(n));
-    std::uint64_t refs_before = t->refs;
     AddStateRefs(t, n, refs);
     t->nodes += 1;
-    std::uint64_t segs = static_cast<std::uint64_t>(n->segments.size());
-    t->segments += segs;
+    t->segments += static_cast<std::uint64_t>(n->segments.size());
     t->tokens += n->token_count;
     t->footprint += TokenFootprint(n->edge);
-    std::uint64_t refs_added = t->refs - refs_before;
-    bool is_prefix = n->token_count > 0;
-    if (is_prefix) ++t->prefixes;
-    g_nodes_ += 1;
-    g_segments_ += segs;
-    g_tokens_ += n->token_count;
-    g_footprint_ += TokenFootprint(n->edge);
-    g_refs_ += refs_added;
-    if (is_prefix) g_prefixes_ += 1;
+    if (n->token_count > 0) ++t->prefixes;
+    // A prefix that was just added is the most recently used one.
+    n->stats.last_access_ns = ++access_clock_;
     t->by_id[n->id] = n;
     {
       std::unique_lock<std::shared_mutex> lk(id_mtx_);
@@ -374,10 +515,20 @@ struct PrefixIndex::Impl {
     std::size_t i = 0;
     while (true) {
       if (i == tokens.size()) {
+        if (!node->active) {
+          // Adding an invalidated prefix again makes it current under a new
+          // generation. What was attached to the retired one does not come back.
+          node->active = true;
+          t->refs -= static_cast<std::uint64_t>(node->state_refs.size());
+          node->state_refs.clear();
+        }
         node->generation += 1;
         AddStateRefs(t, node, refs);
         if (!provenance.empty()) node->provenance = provenance;
+        const std::uint64_t had = static_cast<std::uint64_t>(node->segments.size());
         node->segments = ComputeSegmentsFor(t->compat, Full(node));
+        t->segments += static_cast<std::uint64_t>(node->segments.size()) - had;
+        node->stats.last_access_ns = ++access_clock_;
         return node;
       }
       TreeNode* child = nullptr;
@@ -407,10 +558,23 @@ struct PrefixIndex::Impl {
       split->depth = node->depth + 1;
       child->edge.assign(child->edge.begin() + static_cast<std::ptrdiff_t>(lcp), child->edge.end());
       child->parent = split;
-      child->depth = split->depth + 1;
+      // The whole moved subtree is one level deeper and hangs below the split node.
+      {
+        std::vector<TreeNode*> moved{child};
+        while (!moved.empty()) {
+          TreeNode* m = moved.back(); moved.pop_back();
+          m->depth += 1;
+          for (auto& g : m->children) moved.push_back(g.get());
+        }
+      }
+      split->descendant_count = 1 + child->descendant_count;
       InsertChildSorted(split, std::move(child_owned));
       InsertChildSorted(node, std::move(split_ptr));
-      FinalizeNew(t, split, refs, provenance, shard);
+      // The references describe the prefix being inserted. The split node is a
+      // different, shorter prefix unless the insert ends exactly here.
+      static const std::vector<StateReference> kNoRefs;
+      FinalizeNew(t, split, (i + lcp == tokens.size()) ? refs : kNoRefs, provenance, shard);
+      t->footprint -= TokenFootprint(split->edge);  // those tokens moved off the child's edge
       node = split;
       i += lcp;
     }
@@ -462,15 +626,18 @@ struct PrefixIndex::Impl {
       if (cur->token_count > 0) ++t->prefixes;
       for (auto& ch : cur->children) stack.push_back(ch.get());
     }
-    // Post-order recompute of descendant_count.
-    for (auto it = t->by_id.begin(); it != t->by_id.end(); ++it) {
-      TreeNode* n = it->second;
+    // Descendant counts, children before their parents.
+    std::vector<TreeNode*> order = Preorder(t->root.get());
+    for (auto it = order.rbegin(); it != order.rend(); ++it) {
+      TreeNode* n = *it;
       n->descendant_count = 0;
       for (auto& c : n->children) n->descendant_count += (1 + c->descendant_count);
     }
     {
+      // The root is not a prefix: its id is never published.
       std::unique_lock<std::shared_mutex> lk(id_mtx_);
-      for (auto& kv : t->by_id) id_index_[kv.first] = IdEntry{shard, t->key};
+      for (auto& kv : t->by_id)
+        if (kv.second != t->root.get()) id_index_[kv.first] = IdEntry{shard, t->key};
     }
   }
 
@@ -493,6 +660,12 @@ struct PrefixIndex::Impl {
     double freq = static_cast<double>(n->stats.hit_count + n->stats.lookup_count);
     double recency = static_cast<double>(n->stats.last_access_ns);
     double structural = static_cast<double>(n->children.size());
+    switch (cfg.policy) {
+      case EvictionPolicy::kLruRecency: return recency;
+      case EvictionPolicy::kLfuFrequency: return freq;
+      case EvictionPolicy::kStructuralValue: return structural;
+      case EvictionPolicy::kComposite: break;
+    }
     return cfg.frequency_weight * freq + cfg.recency_weight * recency +
            cfg.structural_weight * structural;
   }
@@ -501,12 +674,12 @@ struct PrefixIndex::Impl {
   std::size_t RemoveSubtree(std::size_t shard, Trie* t, TreeNode* n, std::string& err) {
     if (n == t->root.get()) { err = "cannot remove root"; return 0; }
     if (!n->parent) { err = "orphaned node"; return 0; }
-    // Count descendants for the return value.
-    std::size_t removed = 0;
+    const Counts before = CountsOf(t);
+    std::vector<PrefixId> gone;
     std::vector<TreeNode*> stack{n};
     while (!stack.empty()) {
       TreeNode* cur = stack.back(); stack.pop_back();
-      ++removed;
+      gone.push_back(cur->id);
       for (auto& ch : cur->children) stack.push_back(ch.get());
     }
     // Detach n (and its subtree) by releasing the owning unique_ptr.
@@ -515,6 +688,63 @@ struct PrefixIndex::Impl {
       if (sib[k].get() == n) { sib[k].reset(); sib.erase(sib.begin() + static_cast<std::ptrdiff_t>(k)); break; }
     // Recompute counters and id mappings for the whole trie.
     RecomputeTrie(shard, t);
+    {
+      // The ids of removed prefixes no longer resolve; the id map does not keep them.
+      std::unique_lock<std::shared_mutex> lk(id_mtx_);
+      for (const auto& id : gone) {
+        auto it = id_index_.find(id);
+        if (it != id_index_.end() && it->second.shard == shard && it->second.key == t->key) id_index_.erase(it);
+      }
+    }
+    Settle(before, Counts{}, CountsOf(t));
+    return gone.size();
+  }
+
+  // Evict up to `target` prefixes, lowest score first. Only a prefix without
+  // descendants is ever removed, so nothing disappears that is not reported;
+  // removing it can expose its parent, which the next round then considers.
+  // Invalidated prefixes go first. `keep`, when set, is left alone.
+  std::vector<PrefixId> EvictLeaves(std::size_t target, const PrefixId* keep) {
+    struct Cand { std::size_t shard; std::string key; PrefixId id; bool active; double score; };
+    std::vector<PrefixId> removed;
+    while (removed.size() < target) {
+      std::vector<Cand> cands;
+      {
+        std::vector<std::unique_lock<std::mutex>> locks;
+        for (std::size_t s = 0; s < kNumShards; ++s) locks.emplace_back(shards_[s].mtx);
+        for (std::size_t s = 0; s < kNumShards; ++s) {
+          for (auto& t : shards_[s].trees) {
+            for (TreeNode* n : Preorder(t->root.get())) {
+              if (!n->parent || !n->children.empty()) continue;
+              if (keep && n->id == *keep) continue;
+              cands.push_back(Cand{s, t->key, n->id, n->active, EvictionScoreNode(cfg.eviction, n)});
+            }
+          }
+        }
+      }
+      if (cands.empty()) break;
+      std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
+        if (a.active != b.active) return !a.active;
+        if (a.score != b.score) return a.score < b.score;
+        return a.id < b.id;
+      });
+      const std::size_t had = removed.size();
+      for (auto& c : cands) {
+        if (removed.size() >= target) break;
+        auto& sh = shards_[c.shard];
+        std::lock_guard<std::mutex> lk(sh.mtx);
+        Trie* t = FindTree(sh, c.key);
+        if (!t) continue;
+        auto it = t->by_id.find(c.id);
+        if (it == t->by_id.end()) continue;
+        TreeNode* n = it->second;
+        if (!n->parent || !n->children.empty()) continue;
+        std::string err;
+        RemoveSubtree(c.shard, t, n, err);
+        if (err.empty()) { removed.push_back(c.id); ++total_evictions_; }
+      }
+      if (removed.size() == had) break;
+    }
     return removed;
   }
 
@@ -583,7 +813,7 @@ PrefixMatch PrefixIndex::LongestPrefixMatch(const CompatibilityKey& compat,
   TokenSequence us(request.begin() + static_cast<std::ptrdiff_t>(node->token_count), request.end());
   bool exact = (node->token_count == request.size());
   node->stats.lookup_count += 1;
-  node->stats.last_access_ns = ++impl.access_clock_ + 1000000ULL * node->stats.lookup_count;
+  node->stats.last_access_ns = ++impl.access_clock_;
   node->stats.hit_count += 1;
   node->stats.reused_tokens += node->token_count;
   if (exact) node->stats.exact_hit_count += 1; else node->stats.partial_hit_count += 1;
@@ -655,13 +885,8 @@ std::vector<PrefixMatch> PrefixIndex::AllMatches(const CompatibilityKey& compat,
 std::uint64_t PrefixIndex::CommonPrefixLength(const CompatibilityKey& compat,
                                               const TokenSequence& a,
                                               const TokenSequence& b) {
-  auto& impl = *impl_;
-  std::string key = compat.IdentityHex();
-  std::size_t shard = impl.KeyShard(key);
-  auto& sh = impl.ShardAt(shard);
-  std::lock_guard<std::mutex> lk(sh.mtx);
-  Trie* t = impl.FindTree(sh, key);
-  if (!t) return 0;
+  // A property of the two sequences alone: it does not depend on what is indexed.
+  (void)compat;
   return static_cast<std::uint64_t>(CommonPrefix(a, 0, b, 0));
 }
 
@@ -673,39 +898,37 @@ Result<PrefixRecord> PrefixIndex::Insert(const CompatibilityKey& compat,
   auto& impl = *impl_;
   std::string key = compat.IdentityHex();
   std::size_t shard = impl.KeyShard(key);
-  // Capacity gate on prefix count (strict when auto_evict is off).
-  std::uint64_t cap = impl.cfg.capacity.max_prefixes;
-  if (!impl.cfg.eviction.auto_evict && impl.g_prefixes_.load() >= cap) {
-    return Result<PrefixRecord>::Err(Error{ErrorCode::kCapacityExceeded, "prefix capacity reached"});
-  }
-  const std::uint64_t max_segs = impl.cfg.capacity.max_segments;
-  const std::uint64_t max_refs = impl.cfg.capacity.max_state_references;
-  const std::uint64_t max_nodes = impl.cfg.capacity.max_nodes_total;
-  const std::uint64_t max_tokens = impl.cfg.capacity.max_token_index_footprint / 4u;
-  std::uint64_t proj_segs = (tokens.empty() ? 1 : tokens.size() / (impl.cfg.segmentation.fixed_size ? impl.cfg.segmentation.fixed_size : 1) + 1);
-  std::uint64_t proj_nodes = tokens.size() + 1;
-  std::uint64_t proj_refs = refs.size();
+  const std::uint64_t cap = impl.cfg.capacity.max_prefixes;
+  const bool hard = !impl.cfg.eviction.auto_evict;
   Result<PrefixRecord> res;
   {
     auto& sh = impl.ShardAt(shard);
     std::lock_guard<std::mutex> lk(sh.mtx);
-    Trie* t = impl.GetOrCreateTree(sh, compat);
-    if (!impl.cfg.eviction.auto_evict) {
-      if (impl.g_nodes_.load() + proj_nodes > max_nodes) return Result<PrefixRecord>::Err(Error{ErrorCode::kCapacityExceeded, "node capacity reached"});
-      if (impl.g_segments_.load() + proj_segs > max_segs) return Result<PrefixRecord>::Err(Error{ErrorCode::kCapacityExceeded, "segment capacity reached"});
-      if (impl.g_refs_.load() + proj_refs > max_refs) return Result<PrefixRecord>::Err(Error{ErrorCode::kCapacityExceeded, "reference capacity reached"});
-      if (impl.g_tokens_.load() + tokens.size() > max_tokens) return Result<PrefixRecord>::Err(Error{ErrorCode::kCapacityExceeded, "token capacity reached"});
+    Trie* t = impl.FindTree(sh, key);
+    // Hard bounds (auto_evict off): work out exactly what this insert adds and take
+    // that room before anything changes, so a bound is never passed and a refused
+    // insert leaves nothing behind.
+    Impl::Counts held;
+    if (hard) {
+      held = impl.PlanInsert(t, tokens, refs);
+      if (const char* full = impl.Reserve(held))
+        return Result<PrefixRecord>::Err(Error{ErrorCode::kCapacityExceeded, full});
     }
+    const Impl::Counts before = Impl::CountsOf(t);
+    if (!t) t = impl.GetOrCreateTree(sh, compat);
     TreeNode* n = impl.TrieInsert(t, tokens, refs, provenance, shard);
+    impl.Settle(before, held, Impl::CountsOf(t));
     res = impl.MaterializeRecord(t, n);
   }
   // Post-insert enforcement: when auto_evict is on, evict after the insert so the
-  // capacity bound is held immediately (even when one insert branches into many
-  // intermediate prefixes).
-  if (impl.cfg.eviction.auto_evict) {
-    impl.RebuildGlobalCounters();
-    std::uint64_t cur = impl.g_prefixes_.load();
-    if (cur > cap) Evict(static_cast<std::size_t>(cur - cap));
+  // capacity bound is held immediately (even when one insert branches into
+  // intermediate prefixes). Room is made with other prefixes first; the bound
+  // still wins when that is not enough.
+  if (!hard && impl.g_prefixes_.load() > cap) {
+    const PrefixId added = res.value().id;
+    impl.EvictLeaves(static_cast<std::size_t>(impl.g_prefixes_.load() - cap), &added);
+    const std::uint64_t cur = impl.g_prefixes_.load();
+    if (cur > cap) impl.EvictLeaves(static_cast<std::size_t>(cur - cap), nullptr);
   }
   return res;
 }
@@ -731,7 +954,7 @@ Result<void> PrefixIndex::Invalidate(const PrefixId& id, bool subtree) {
     if (c->active) {
       c->active = false;
       c->generation += 1;
-      for (auto& r : c->state_refs) { if (r.freshness_ts) *r.freshness_ts = 0; }  // stale
+      for (auto& r : c->state_refs) r.freshness_ts = std::uint64_t{0};  // stale, timestamped or not
       ++impl.total_invalidations_;
     }
   }
@@ -750,7 +973,11 @@ Result<void> PrefixIndex::InvalidateByCompat(const CompatibilityKey& compat) {
   for (auto& c : t->root->children) stack.push_back(c.get());
   while (!stack.empty()) {
     TreeNode* n = stack.back(); stack.pop_back();
-    if (n->active) { n->active = false; n->generation += 1; ++impl.total_invalidations_; }
+    if (n->active) {
+      n->active = false; n->generation += 1;
+      for (auto& r : n->state_refs) r.freshness_ts = std::uint64_t{0};  // stale
+      ++impl.total_invalidations_;
+    }
     for (auto& c : n->children) stack.push_back(c.get());
   }
   return Result<void>::Ok();
@@ -772,12 +999,11 @@ Result<std::size_t> PrefixIndex::Remove(const PrefixId& id, bool cascade) {
     std::string err;
     if (!cascade && !n->IsLeaf()) {
       // only allow removing a leaf unless cascade
-      if (n->descendant_count > 0) return Result<std::size_t>::Err(Error{ErrorCode::kInvalidState, "cannot remove prefix with live descendants without cascade"});
+      return Result<std::size_t>::Err(Error{ErrorCode::kInvalidState, "cannot remove prefix with live descendants without cascade"});
     }
     removed = impl.RemoveSubtree(loc.shard, t, n, err);
     if (!err.empty()) return Result<std::size_t>::Err(Error{ErrorCode::kInvalidState, err});
   }
-  impl.RebuildGlobalCounters();
   ++impl.total_evictions_;
   return Result<std::size_t>::Ok(removed);
 }
@@ -911,7 +1137,7 @@ Result<std::vector<PrefixRecord>> PrefixIndex::CommonAncestors(const PrefixId& a
     if (!t) return Result<std::vector<PrefixId>>::Err(Error{ErrorCode::kNotFound, "no such prefix"});
     auto it = t->by_id.find(x);
     if (it == t->by_id.end()) return Result<std::vector<PrefixId>>::Err(Error{ErrorCode::kNotFound, "no such prefix"});
-    for (auto* n = it->second; n; n = n->parent) ids.push_back(n->id);
+    for (auto* n = it->second; n && n->parent; n = n->parent) ids.push_back(n->id);  // the root is not a prefix
     return Result<std::vector<PrefixId>>::Ok(std::move(ids));
   };
   auto ra = rek(a);
@@ -984,9 +1210,23 @@ Result<std::vector<StateReference>> PrefixIndex::AttachState(const PrefixId& id,
   auto it = t->by_id.find(id);
   if (it == t->by_id.end()) return Result<std::vector<StateReference>>::Err(Error{ErrorCode::kNotFound, "no such prefix"});
   TreeNode* n = it->second;
-  bool present = false;
-  for (auto& e : n->state_refs) if (e.Key() == ref.Key()) { present = true; break; }
-  if (!present) { n->state_refs.push_back(ref); ++t->refs; }
+  bool known = false;
+  for (auto& e : n->state_refs) {
+    if (e.Key() != ref.Key()) continue;
+    known = true;
+    if (ref.generation < e.generation)
+      return Result<std::vector<StateReference>>::Err(Error{ErrorCode::kStaleGeneration, "an attached reference to this object has a newer generation"});
+    break;
+  }
+  Impl::Counts held;
+  if (!known && !impl.cfg.eviction.auto_evict) {
+    if (!Impl::TryAdd(impl.g_refs_, 1, impl.cfg.capacity.max_state_references))
+      return Result<std::vector<StateReference>>::Err(Error{ErrorCode::kCapacityExceeded, "reference capacity reached"});
+    held.refs = 1;
+  }
+  const Impl::Counts before = Impl::CountsOf(t);
+  impl.AttachRef(t, n, ref);
+  impl.Settle(before, held, Impl::CountsOf(t));
   return Result<std::vector<StateReference>>::Ok(n->state_refs);
 }
 
@@ -1002,9 +1242,11 @@ Result<void> PrefixIndex::RetireState(const PrefixId& id, const StateReference& 
   if (it == t->by_id.end()) return Result<void>::Err(Error{ErrorCode::kNotFound, "no such prefix"});
   TreeNode* n = it->second;
   auto& vec = n->state_refs;
+  const Impl::Counts before = Impl::CountsOf(t);
   for (std::size_t k = 0; k < vec.size(); ++k) {
     if (vec[k].Key() == ref.Key()) { vec.erase(vec.begin() + static_cast<std::ptrdiff_t>(k)); if (t->refs > 0) --t->refs; break; }
   }
+  impl.Settle(before, Impl::Counts{}, Impl::CountsOf(t));
   return Result<void>::Ok();
 }
 
@@ -1021,7 +1263,7 @@ Result<void> PrefixIndex::InvalidateStateByObject(const std::string& ns,
         for (std::size_t k = 0; k < vec.size(); ++k) {
           if (vec[k].ns == ns && vec[k].object_id == object_id) {
             vec[k].generation += 1;
-            if (vec[k].freshness_ts) *vec[k].freshness_ts = 0;
+            vec[k].freshness_ts = std::uint64_t{0};  // stale, timestamped or not
           }
         }
       }
@@ -1032,85 +1274,8 @@ Result<void> PrefixIndex::InvalidateStateByObject(const std::string& ns,
 
 // ---- eviction ----
 Result<std::vector<PrefixId>> PrefixIndex::Evict(std::size_t target) {
-  auto& impl = *impl_;
   if (target == 0) return Result<std::vector<PrefixId>>::Ok({});
-  struct Cand { std::size_t shard; std::string key; PrefixId id; double score; };
-  std::vector<Cand> cands;
-  {
-    std::vector<std::unique_lock<std::mutex>> locks;
-    for (std::size_t s = 0; s < kNumShards; ++s) locks.emplace_back(impl.shards_[s].mtx);
-    for (std::size_t s = 0; s < kNumShards; ++s) {
-      auto& sh = impl.shards_[s];
-      for (auto& t : sh.trees) {
-        std::vector<TreeNode*> order = impl.Preorder(t->root.get());
-        for (TreeNode* n : order) {
-          if (n->token_count == 0 || !n->active) continue;
-          if (n->descendant_count > 0) continue;  // protect ancestors of live descendants
-          double score = impl.EvictionScoreNode(impl.cfg.eviction, n);
-          cands.push_back(Cand{s, t->key, n->id, score});
-        }
-      }
-    }
-  }
-  std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
-    if (a.score != b.score) return a.score < b.score;
-    return a.id < b.id;
-  });
-  std::vector<PrefixId> removed;
-  for (auto& c : cands) {
-    if (removed.size() >= target) break;
-    auto& sh = impl.ShardAt(c.shard);
-    std::lock_guard<std::mutex> lk(sh.mtx);
-    Trie* t = impl.FindTree(sh, c.key);
-    if (!t) continue;
-    auto it = t->by_id.find(c.id);
-    if (it == t->by_id.end()) continue;
-    TreeNode* n = it->second;
-    if (n->descendant_count > 0 || !n->active || n->token_count == 0 || !n->parent) continue;
-    std::string err;
-    std::size_t before = impl.RemoveSubtree(c.shard, t, n, err);
-    if (err.empty()) { removed.push_back(c.id); ++impl.total_evictions_; (void)before; }
-  }
-  // If capacity still requires it, cascade-evict whole subtrees (ascending score)
-  // so the hard capacity bound can always be honored even when protected
-  // ancestors dominate.
-  if (removed.size() < target) {
-    std::vector<Cand> all;
-    {
-      std::vector<std::unique_lock<std::mutex>> locks;
-      for (std::size_t s = 0; s < kNumShards; ++s) locks.emplace_back(impl.shards_[s].mtx);
-      for (std::size_t s = 0; s < kNumShards; ++s) {
-        auto& sh = impl.shards_[s];
-        for (auto& t : sh.trees) {
-          std::vector<TreeNode*> order = impl.Preorder(t->root.get());
-          for (TreeNode* n : order) {
-            if (n->token_count == 0 || !n->active || !n->parent) continue;
-            all.push_back(Cand{s, t->key, n->id, impl.EvictionScoreNode(impl.cfg.eviction, n)});
-          }
-        }
-      }
-    }
-    std::sort(all.begin(), all.end(), [](const Cand& a, const Cand& b) {
-      if (a.score != b.score) return a.score < b.score;
-      return a.id < b.id;
-    });
-    for (auto& c : all) {
-      if (removed.size() >= target) break;
-      auto& sh = impl.ShardAt(c.shard);
-      std::lock_guard<std::mutex> lk(sh.mtx);
-      Trie* t = impl.FindTree(sh, c.key);
-      if (!t) continue;
-      auto it = t->by_id.find(c.id);
-      if (it == t->by_id.end()) continue;
-      TreeNode* n = it->second;
-      if (!n->parent || n->token_count == 0) continue;
-      std::string err;
-      if (impl.RemoveSubtree(c.shard, t, n, err) == 0 && !err.empty()) continue;
-      if (err.empty()) { removed.push_back(c.id); ++impl.total_evictions_; }
-    }
-  }
-  impl.RebuildGlobalCounters();
-  return Result<std::vector<PrefixId>>::Ok(std::move(removed));
+  return Result<std::vector<PrefixId>>::Ok(impl_->EvictLeaves(target, nullptr));
 }
 
 // ---- counters ----
@@ -1218,42 +1383,41 @@ std::string PrefixIndex::SerializeBinary() const {
   // payload
   BinaryWriter pay;
   pay.U32(1);  // payload format
-  std::size_t tree_count = 0;
-  for (auto& sh : impl.shards_) tree_count += sh.trees.size();
-  pay.U64(static_cast<std::uint64_t>(tree_count));
-  for (std::size_t s = 0; s < kNumShards; ++s) {
-    auto& sh = impl.shards_[s];
-    std::lock_guard<std::mutex> lk(sh.mtx);
-    std::vector<const Trie*> ts;
-    for (auto& t : sh.trees) ts.push_back(t.get());
-    std::sort(ts.begin(), ts.end(), [](const Trie* a, const Trie* b) { return a->key < b->key; });
-    for (const Trie* t : ts) {
-      WCompat(pay, t->compat);
-      pay.U64(static_cast<std::uint64_t>(t->nodes));
-      std::vector<TreeNode*> order = impl.Preorder(t->root.get());
-      std::unordered_map<TreeNode*, std::uint64_t> idx;
-      for (std::uint64_t k = 0; k < order.size(); ++k) idx[order[k]] = k;
-      for (TreeNode* n : order) {
-        std::uint64_t parent_idx = 0xFFFFFFFFFFFFFFFFULL;
-        if (n->parent) parent_idx = idx[n->parent];
-        pay.U64(parent_idx);
-        pay.U64(static_cast<std::uint64_t>(n->edge.size()));
-        for (TokenId tok : n->edge) pay.U32(tok);
-        pay.U64(n->id.high());
-        pay.U64(n->id.low());
-        pay.RawBytes(n->content_hash.data(), n->content_hash.size());
-        pay.U64(n->token_count);
-        pay.U64(n->generation);
-        pay.U8(n->active ? 1 : 0);
-        pay.U32(n->depth);
-        pay.Bytes(n->provenance);
-        pay.U64(static_cast<std::uint64_t>(n->segments.size()));
-        for (auto& sg : n->segments) WSeg(pay, sg);
-        pay.U64(static_cast<std::uint64_t>(n->state_refs.size()));
-        for (auto& rf : n->state_refs) WRef(pay, rf);
-      }
+  // One consistent view: every shard is held while the index is written, and the
+  // trees are ordered by compatibility identity across the whole index.
+  std::vector<std::unique_lock<std::mutex>> locks;
+  for (std::size_t s = 0; s < kNumShards; ++s) locks.emplace_back(impl.shards_[s].mtx);
+  std::vector<const Trie*> ts;
+  for (auto& sh : impl.shards_) for (auto& t : sh.trees) ts.push_back(t.get());
+  std::sort(ts.begin(), ts.end(), [](const Trie* a, const Trie* b) { return a->key < b->key; });
+  pay.U64(static_cast<std::uint64_t>(ts.size()));
+  for (const Trie* t : ts) {
+    WCompat(pay, t->compat);
+    std::vector<TreeNode*> order = impl.Preorder(t->root.get());
+    pay.U64(static_cast<std::uint64_t>(order.size()));
+    std::unordered_map<TreeNode*, std::uint64_t> idx;
+    for (std::uint64_t k = 0; k < order.size(); ++k) idx[order[k]] = k;
+    for (TreeNode* n : order) {
+      std::uint64_t parent_idx = 0xFFFFFFFFFFFFFFFFULL;
+      if (n->parent) parent_idx = idx[n->parent];
+      pay.U64(parent_idx);
+      pay.U64(static_cast<std::uint64_t>(n->edge.size()));
+      for (TokenId tok : n->edge) pay.U32(tok);
+      pay.U64(n->id.high());
+      pay.U64(n->id.low());
+      pay.RawBytes(n->content_hash.data(), n->content_hash.size());
+      pay.U64(n->token_count);
+      pay.U64(n->generation);
+      pay.U8(n->active ? 1 : 0);
+      pay.U32(n->depth);
+      pay.Bytes(n->provenance);
+      pay.U64(static_cast<std::uint64_t>(n->segments.size()));
+      for (auto& sg : n->segments) WSeg(pay, sg);
+      pay.U64(static_cast<std::uint64_t>(n->state_refs.size()));
+      for (auto& rf : n->state_refs) WRef(pay, rf);
     }
   }
+  locks.clear();
   std::string payload = pay.take();
   body.RawBytes(payload);
   std::string body_s = body.take();
@@ -1264,10 +1428,13 @@ std::string PrefixIndex::SerializeBinary() const {
 }
 Result<std::size_t> PrefixIndex::DeserializeBinary(std::string_view bytes,
                                                    std::string* error_detail) {
-  auto& impl = *impl_;
   auto setErr = [&](const std::string& m) { if (error_detail) *error_detail = m; };
-  if (bytes.size() < 8 + 32) { setErr("blob too small"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "blob too small"}); }
-  if (bytes.substr(0, 4) != std::string_view("PFSX", 4)) { setErr("bad magic"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "bad magic"}); }
+  auto corrupt = [&](const char* m) {
+    setErr(m);
+    return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, m});
+  };
+  if (bytes.size() < 8 + 32) return corrupt("blob too small");
+  if (bytes.substr(0, 4) != std::string_view("PFSX", 4)) return corrupt("bad magic");
   std::string_view body = bytes.substr(0, bytes.size() - 32);
   std::string_view stored = bytes.substr(bytes.size() - 32, 32);
   ContentHash computed = Sha256::HashBytes(body.data(), body.size());
@@ -1275,90 +1442,153 @@ Result<std::size_t> PrefixIndex::DeserializeBinary(std::string_view bytes,
     setErr("checksum mismatch (corruption)");
     return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "checksum mismatch"});
   }
-  Clear();
-  BinaryReader r(body.substr(8));
+  BinaryReader r(body.substr(4));
+  auto container = r.U32();
+  if (!container || *container != 1) return corrupt("unsupported container version");
   auto ver = r.U32();
   if (!ver || *ver != 1) { setErr("unsupported payload version"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "unsupported version"}); }
   auto tree_count = r.U64();
-  if (!tree_count) { setErr("missing tree count"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "missing tree count"}); }
+  if (!tree_count) return corrupt("missing tree count");
   if (*tree_count > 1000000) { setErr("tree count too large"); return Result<std::size_t>::Err(Error{ErrorCode::kInvalidArgument, "tree count too large"}); }
+
+  // The new state is built on the side and swapped in only when the whole blob is
+  // valid, so a blob that is refused leaves the live index exactly as it was.
+  PrefixIndex staged(impl_->cfg);
+  Impl& st = *staged.impl_;
+  const CapacityPolicy& cap = st.cfg.capacity;
   for (std::uint64_t ti = 0; ti < *tree_count; ++ti) {
     auto compat = RCompat(r);
-    if (!compat) { setErr("compat parse"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "compat parse"}); }
-    std::size_t shard = impl.KeyShard(compat->IdentityHex());
-    auto& sh = impl.shards_[shard];
-    std::lock_guard<std::mutex> lk(sh.mtx);
-    Trie* t = impl.GetOrCreateTree(sh, *compat);
+    if (!compat) return corrupt("compat parse");
+    const std::string key = compat->IdentityHex();
+    std::size_t shard = st.KeyShard(key);
+    auto& sh = st.shards_[shard];
+    if (st.FindTree(sh, key)) return corrupt("duplicate compatibility tree");
+    Trie* t = st.GetOrCreateTree(sh, *compat);
     auto node_count = r.U64();
-    if (!node_count) { setErr("missing node count"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "missing node count"}); }
-    if (impl.cfg.capacity.max_nodes_total != 0 && *node_count > impl.cfg.capacity.max_nodes_total + 1) {
+    if (!node_count) return corrupt("missing node count");
+    if (*node_count == 0) return corrupt("tree without a root");
+    if (*node_count - 1 > cap.max_nodes_total) {
       setErr("node count exceeds capacity"); return Result<std::size_t>::Err(Error{ErrorCode::kInvalidArgument, "node count exceeds capacity"});
     }
     std::vector<TreeNode*> nodes;
     nodes.reserve(static_cast<std::size_t>(*node_count));
+    std::vector<TreeNode*> chain;  // the previous node and its ancestors, root first
+    TokenSequence path;            // the tokens spelled by the node being read
     for (std::uint64_t ni = 0; ni < *node_count; ++ni) {
       auto parent_idx = r.U64();
-      if (!parent_idx) { setErr("missing parent index"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "parent index"}); }
+      if (!parent_idx) return corrupt("parent index");
       auto ecnt = r.U64();
-      if (!ecnt) { setErr("missing edge count"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "edge count"}); }
-      if (*ecnt > (1u << 24)) { setErr("edge count implausible"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "edge count"}); }
+      if (!ecnt) return corrupt("edge count");
+      if (*ecnt > (1u << 24)) return corrupt("edge count implausible");
       TreeNode n;
       n.edge.reserve(static_cast<std::size_t>(*ecnt));
       for (std::uint64_t e = 0; e < *ecnt; ++e) {
         auto tok = r.U32();
-        if (!tok) { setErr("missing token"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "token"}); }
+        if (!tok) return corrupt("token");
         n.edge.push_back(*tok);
       }
       auto hi = r.U64(); auto lo = r.U64();
-      if (!hi || !lo) { setErr("missing id"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "id"}); }
+      if (!hi || !lo) return corrupt("id");
       n.id = PrefixId(*hi, *lo);
       auto h = r.ReadRaw(32);
-      if (!h || h->size() != 32) { setErr("missing hash"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "hash"}); }
+      if (!h || h->size() != 32) return corrupt("hash");
       std::copy(h->begin(), h->end(), n.content_hash.begin());
-      auto cnt = r.U64(); if (!cnt) { setErr("missing count"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "count"}); }
+      auto cnt = r.U64(); if (!cnt) return corrupt("count");
       n.token_count = *cnt;
-      auto gen = r.U64(); if (!gen) { setErr("missing generation"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "generation"}); }
+      auto gen = r.U64(); if (!gen) return corrupt("generation");
       n.generation = *gen;
-      auto act = r.U8(); if (!act) { setErr("missing active"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "active"}); }
+      auto act = r.U8(); if (!act) return corrupt("active");
       n.active = *act != 0;
-      auto dep = r.U32(); if (!dep) { setErr("missing depth"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "depth"}); }
-      n.depth = *dep;
-      auto prov = r.Str(1u << 20); if (!prov) { setErr("missing provenance"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "provenance"}); }
+      auto dep = r.U32(); if (!dep) return corrupt("depth");
+      auto prov = r.Str(1u << 20); if (!prov) return corrupt("provenance");
       n.provenance = *prov;
       auto s_cnt = r.U64();
-      if (!s_cnt || *s_cnt > 1000000) { setErr("segment count"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "segment count"}); }
-      for (std::uint64_t si = 0; si < *s_cnt; ++si) { auto sg = RSeg(r); if (!sg) { setErr("segment parse"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "segment"}); } n.segments.push_back(std::move(*sg)); }
+      if (!s_cnt || *s_cnt > 1000000) return corrupt("segment count");
+      for (std::uint64_t si = 0; si < *s_cnt; ++si) { auto sg = RSeg(r); if (!sg) return corrupt("segment"); n.segments.push_back(std::move(*sg)); }
       auto rf_cnt = r.U64();
-      if (!rf_cnt || *rf_cnt > 1000000) { setErr("ref count"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "ref count"}); }
-      for (std::uint64_t ri = 0; ri < *rf_cnt; ++ri) { auto rf = RRef(r); if (!rf) { setErr("ref parse"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "ref"}); } n.state_refs.push_back(std::move(*rf)); }
+      if (!rf_cnt || *rf_cnt > 1000000) return corrupt("ref count");
+      for (std::uint64_t ri = 0; ri < *rf_cnt; ++ri) { auto rf = RRef(r); if (!rf) return corrupt("ref"); n.state_refs.push_back(std::move(*rf)); }
+      // What a node says about itself must follow from where it sits: a blob that
+      // was written for another namespace or compatibility, or whose structure
+      // does not hold together, is refused instead of being trusted.
+      for (const auto& sg : n.segments)
+        if (sg.token_offset > n.token_count || sg.token_count > n.token_count - sg.token_offset)
+          return corrupt("segment outside its prefix");
       if (ni == 0) {
-        t->root->edge = std::move(n.edge);
-        t->root->id = n.id; t->root->content_hash = n.content_hash;
-        t->root->token_count = n.token_count; t->root->generation = n.generation; t->root->active = n.active;
-        t->root->depth = n.depth; t->root->provenance = n.provenance;
+        if (*parent_idx != 0xFFFFFFFFFFFFFFFFULL || !n.edge.empty() || n.token_count != 0 ||
+            n.id != t->root->id || n.content_hash != t->root->content_hash)
+          return corrupt("root does not match this namespace and compatibility");
+        t->root->generation = n.generation; t->root->active = n.active;
+        t->root->provenance = n.provenance;
         t->root->segments = std::move(n.segments); t->root->state_refs = std::move(n.state_refs);
-        t->root->parent = nullptr; t->root->full_spell.reset();
         nodes.push_back(t->root.get());
+        chain.assign(1, t->root.get());
       } else {
-        if (*parent_idx == 0xFFFFFFFFFFFFFFFFULL) { setErr("orphan node"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "orphan node"}); }
-        if (*parent_idx >= nodes.size()) { setErr("bad parent index"); return Result<std::size_t>::Err(Error{ErrorCode::kCorruption, "bad parent index"}); }
+        if (*parent_idx == 0xFFFFFFFFFFFFFFFFULL) return corrupt("orphan node");
+        if (*parent_idx >= nodes.size()) return corrupt("bad parent index");
+        TreeNode* parent = nodes[static_cast<std::size_t>(*parent_idx)];
+        while (!chain.empty() && chain.back() != parent) chain.pop_back();
+        if (chain.empty()) return corrupt("nodes are not in preorder");
+        if (n.edge.empty()) return corrupt("empty edge");
+        path.resize(static_cast<std::size_t>(parent->token_count));
+        path.insert(path.end(), n.edge.begin(), n.edge.end());
+        if (n.token_count != path.size()) return corrupt("token count does not match the path");
+        const ContentHash want = ComputePrefixContentHash(st.cfg.ns, t->compat, path);
+        if (n.content_hash != want || n.id != PrefixId::FromContentHash(want))
+          return corrupt("identity does not match the content");
+        auto& kids = parent->children;
+        auto pos = std::lower_bound(kids.begin(), kids.end(), n.edge,
+            [](const std::unique_ptr<TreeNode>& a, const TokenSequence& e) { return a->edge < e; });
+        if ((pos != kids.end() && (*pos)->edge.front() == n.edge.front()) ||
+            (pos != kids.begin() && (*(pos - 1))->edge.front() == n.edge.front()))
+          return corrupt("two edges of one node start with the same token");
         auto up = std::make_unique<TreeNode>(std::move(n));
         TreeNode* raw = up.get();
-        raw->parent = nodes[static_cast<std::size_t>(*parent_idx)];
+        raw->parent = parent;
+        raw->depth = parent->depth + 1;
         raw->full_spell.reset();
-        impl.InsertChildSorted(raw->parent, std::move(up));
+        st.InsertChildSorted(parent, std::move(up));
         nodes.push_back(raw);
+        chain.push_back(raw);
       }
     }
-    impl.RecomputeTrie(shard, t);
+    st.RecomputeTrie(shard, t);
   }
-  impl.RebuildGlobalCounters();
-  return Result<std::size_t>::Ok(impl.g_prefixes_.load());
+  st.RebuildGlobalCounters();
+  if (!st.cfg.eviction.auto_evict &&
+      (st.g_prefixes_.load() > cap.max_prefixes || st.g_nodes_.load() > cap.max_nodes_total ||
+       st.g_segments_.load() > cap.max_segments || st.g_refs_.load() > cap.max_state_references ||
+       st.g_tokens_.load() > cap.max_token_index_footprint / 4u)) {
+    setErr("persisted index exceeds the configured capacity");
+    return Result<std::size_t>::Err(Error{ErrorCode::kCapacityExceeded, "persisted index exceeds the configured capacity"});
+  }
+
+  Impl& live = *impl_;
+  {
+    std::vector<std::unique_lock<std::mutex>> locks;
+    for (std::size_t s = 0; s < kNumShards; ++s) locks.emplace_back(live.shards_[s].mtx);
+    for (std::size_t s = 0; s < kNumShards; ++s) {
+      live.shards_[s].trees = std::move(st.shards_[s].trees);
+      live.shards_[s].by_key = std::move(st.shards_[s].by_key);
+    }
+    {
+      std::unique_lock<std::shared_mutex> lk(live.id_mtx_);
+      live.id_index_ = std::move(st.id_index_);
+    }
+    live.g_prefixes_ = st.g_prefixes_.load(); live.g_segments_ = st.g_segments_.load();
+    live.g_refs_ = st.g_refs_.load(); live.g_nodes_ = st.g_nodes_.load();
+    live.g_tokens_ = st.g_tokens_.load(); live.g_footprint_ = st.g_footprint_.load();
+    live.total_invalidations_ = 0; live.total_evictions_ = 0;
+  }
+  if (live.cfg.eviction.auto_evict && live.g_prefixes_.load() > cap.max_prefixes)
+    live.EvictLeaves(static_cast<std::size_t>(live.g_prefixes_.load() - cap.max_prefixes), nullptr);
+  return Result<std::size_t>::Ok(live.g_prefixes_.load());
 }
 void PrefixIndex::Clear() {
   auto& impl = *impl_;
+  std::vector<std::unique_lock<std::mutex>> locks;
+  for (std::size_t s = 0; s < kNumShards; ++s) locks.emplace_back(impl.shards_[s].mtx);
   for (auto& sh : impl.shards_) {
-    std::lock_guard<std::mutex> lk(sh.mtx);
     sh.trees.clear();
     sh.by_key.clear();
   }

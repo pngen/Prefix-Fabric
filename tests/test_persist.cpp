@@ -4,8 +4,12 @@
 #include "prefix_fabric/store.hpp"
 #include "prefix_fabric/compatibility.hpp"
 
+#include "prefix_fabric/hash.hpp"
+
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <initializer_list>
 #include <string>
 
 using namespace prefix_fabric;
@@ -98,6 +102,113 @@ PF_TEST(Persistence_BadMagicRejected) {
   auto res = store.LoadFromFile("pers_magic.bin");
   CHECK(res.is_err());
   std::remove("pers_magic.bin");
+}
+
+// Recompute the trailing SHA-256 after editing the body, so the blob is intact
+// as far as its checksum goes and only its content is wrong.
+static std::string Resealed(std::string bytes) {
+  const std::size_t body = bytes.size() - 32;
+  const auto sum = Sha256::HashBytes(bytes.data(), body);
+  for (std::size_t i = 0; i < 32; ++i) bytes[body + i] = static_cast<char>(sum[i]);
+  return bytes;
+}
+static std::string U32Bytes(std::initializer_list<std::uint32_t> values) {
+  std::string s;
+  for (std::uint32_t v : values) for (int i = 0; i < 4; ++i) s.push_back(static_cast<char>((v >> (8 * i)) & 0xffu));
+  return s;
+}
+
+PF_TEST(Persistence_RefusedLoadKeepsLiveState) {
+  CompatibilityKey ca = C();
+  PrefixStore::Options o; o.ns = "pers"; o.default_compat = ca; o.segmentation.policy = SegmentationPolicy::kSingle;
+  PrefixStore source(o);
+  source.Add(ca, {1,2,3,4,5}, {}, "pers");
+  std::string path = "pers_keep.bin";
+  CHECK(source.SaveToFile(path).is_ok());
+  std::string bytes = Slurp(path);
+  CHECK(bytes.size() > 44);
+  if (bytes.size() <= 44) return;
+  // A blob in a later payload format: intact, correctly checksummed, not readable here.
+  bytes[8] = 2;
+  Write(path, Resealed(bytes));
+  PrefixStore live(o);
+  CHECK(live.Add(ca, {7,8,9}, {}, "live").is_ok());
+  CHECK(live.LoadFromFile(path).is_err());
+  // A load that failed takes nothing away from what was live.
+  CHECK_EQ(live.PrefixCount(), 1u);
+  CHECK(live.ExactMatch({7,8,9}, &ca).is_matched());
+  std::remove(path.c_str());
+}
+
+PF_TEST(Persistence_ContentMustMatchIdentity) {
+  CompatibilityKey ca = C();
+  PrefixStore::Options o; o.ns = "pers"; o.default_compat = ca; o.segmentation.policy = SegmentationPolicy::kSingle;
+  PrefixStore source(o);
+  source.Add(ca, {1000001, 1000002, 1000003}, {}, "pers");
+  std::string path = "pers_ident.bin";
+  CHECK(source.SaveToFile(path).is_ok());
+  const std::string bytes = Slurp(path);
+  const std::size_t at = bytes.find(U32Bytes({1000001, 1000002, 1000003}));
+  CHECK(at != std::string::npos);
+  if (at == std::string::npos) return;
+  {
+    // Different tokens under the id and hash of the original ones.
+    std::string edited = bytes; edited[at] ^= 0x01;
+    Write(path, Resealed(edited));
+    PrefixStore s(o);
+    CHECK(s.LoadFromFile(path).is_err());
+    CHECK_EQ(s.PrefixCount(), 0u);
+  }
+  {
+    // A token count the stored tokens do not add up to (edge, id, hash, then the count).
+    std::string edited = bytes; edited[at + 12 + 16 + 32] = 9;
+    Write(path, Resealed(edited));
+    PrefixStore s(o);
+    CHECK(s.LoadFromFile(path).is_err());
+    CHECK_EQ(s.PrefixCount(), 0u);
+  }
+  {
+    // A copy saved for another namespace is a different set of prefixes.
+    Write(path, bytes);
+    PrefixStore::Options other = o; other.ns = "elsewhere";
+    PrefixStore s(other);
+    CHECK(s.LoadFromFile(path).is_err());
+    CHECK_EQ(s.PrefixCount(), 0u);
+  }
+  std::remove(path.c_str());
+}
+
+PF_TEST(Persistence_BoundsApplyToFiles) {
+  CompatibilityKey ca = C();
+  PrefixStore::Options o; o.ns = "pers"; o.default_compat = ca; o.segmentation.policy = SegmentationPolicy::kSingle;
+  PrefixStore source(o);
+  source.Add(ca, {1,2,3}, {}, "pers"); source.Add(ca, {4,5,6}, {}, "pers"); source.Add(ca, {7,8,9}, {}, "pers");
+  std::string path = "pers_bounds.bin";
+  CHECK(source.SaveToFile(path).is_ok());
+  {
+    // More prefixes than this store may hold.
+    PrefixStore::Options small = o; small.capacity.max_prefixes = 2;
+    PrefixStore s(small);
+    auto res = s.LoadFromFile(path);
+    CHECK(res.is_err());
+    if (res.is_err()) CHECK(res.error().code() == ErrorCode::kCapacityExceeded);
+    CHECK_EQ(s.PrefixCount(), 0u);
+  }
+  {
+    // A file larger than the serialized-object bound is not read, and an index
+    // that serializes to more than the bound is not written.
+    PrefixStore::Options tiny = o; tiny.capacity.max_serialized_object_bytes = 64;
+    PrefixStore s(tiny);
+    auto res = s.LoadFromFile(path);
+    CHECK(res.is_err());
+    if (res.is_err()) CHECK(res.error().code() == ErrorCode::kCapacityExceeded);
+    CHECK(s.Add(ca, {1,2,3}, {}, "pers").is_ok());
+    auto sv = s.SaveToFile("pers_bounds_out.bin");
+    CHECK(sv.is_err());
+    if (sv.is_err()) CHECK(sv.error().code() == ErrorCode::kCapacityExceeded);
+    std::remove("pers_bounds_out.bin");
+  }
+  std::remove(path.c_str());
 }
 
 int main() { return pftest::RunAll(); }

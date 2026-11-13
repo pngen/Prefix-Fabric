@@ -104,7 +104,7 @@ function TrieInsert(t, tokens, refs, provenance):
         child.depth = split.depth + 1
         insert child into split.children (sorted)
         insert split into node.children (sorted)
-        FinalizeNew(t, split, refs, provenance)
+        FinalizeNew(t, split, refs if i+lcp == tokens.size() else none, provenance)
         node = split
         i += lcp
 

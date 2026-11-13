@@ -27,7 +27,7 @@ static std::wstring ToWide(const std::string& s) {
 }
 #endif
 
-Result<void> ReadFile(const std::string& path, std::string& out) {
+Result<void> ReadFile(const std::string& path, std::string& out, std::uint64_t max_bytes) {
 #ifdef _WIN32
   HANDLE h = CreateFileW(ToWide(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -35,18 +35,26 @@ Result<void> ReadFile(const std::string& path, std::string& out) {
     return Result<void>::Err(Error{ErrorCode::kIoError, "create/read file failed"});
   LARGE_INTEGER sz{};
   if (!GetFileSizeEx(h, &sz)) { CloseHandle(h); return Result<void>::Err(Error{ErrorCode::kIoError, "size"}); }
-  out.resize(static_cast<std::size_t>(sz.QuadPart));
-  DWORD total = 0;
-  while (total < static_cast<DWORD>(sz.QuadPart)) {
-    DWORD chunk = static_cast<DWORD>(sz.QuadPart - total);
+  const std::uint64_t size = static_cast<std::uint64_t>(sz.QuadPart);
+  if (size > max_bytes) { CloseHandle(h); return Result<void>::Err(Error{ErrorCode::kCapacityExceeded, "file exceeds max_serialized_object_bytes"}); }
+  out.resize(static_cast<std::size_t>(size));
+  // 64-bit progress, bounded chunks: a size that does not fit a DWORD is not cut short.
+  std::uint64_t total = 0;
+  while (total < size) {
+    const std::uint64_t left = size - total;
+    DWORD chunk = static_cast<DWORD>(left < (1u << 30) ? left : (1u << 30));
     DWORD read = 0;
     if (!::ReadFile(h, out.data() + total, chunk, &read, nullptr)) { CloseHandle(h); return Result<void>::Err(Error{ErrorCode::kIoError, "read"}); }
-    if (read == 0) break;
+    if (read == 0) { CloseHandle(h); return Result<void>::Err(Error{ErrorCode::kIoError, "short read"}); }
     total += read;
   }
   CloseHandle(h);
   return Result<void>::Ok();
 #else
+  std::error_code ec;
+  const auto size = std::filesystem::file_size(path, ec);
+  if (ec) return Result<void>::Err(Error{ErrorCode::kIoError, "open"});
+  if (static_cast<std::uint64_t>(size) > max_bytes) return Result<void>::Err(Error{ErrorCode::kCapacityExceeded, "file exceeds max_serialized_object_bytes"});
   std::ifstream f(path, std::ios::binary);
   if (!f) return Result<void>::Err(Error{ErrorCode::kIoError, "open"});
   out.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -61,9 +69,11 @@ Result<void> WriteFileAtomic(const std::string& path, const std::string& data) {
                          FILE_ATTRIBUTE_NORMAL, nullptr);
   if (h == INVALID_HANDLE_VALUE)
     return Result<void>::Err(Error{ErrorCode::kIoError, "create temp file failed"});
-  DWORD total = 0;
-  while (total < static_cast<DWORD>(data.size())) {
-    DWORD chunk = static_cast<DWORD>(data.size() - total);
+  std::uint64_t total = 0;
+  const std::uint64_t size = static_cast<std::uint64_t>(data.size());
+  while (total < size) {
+    const std::uint64_t left = size - total;
+    DWORD chunk = static_cast<DWORD>(left < (1u << 30) ? left : (1u << 30));
     DWORD written = 0;
     if (!WriteFile(h, data.data() + total, chunk, &written, nullptr)) {
       CloseHandle(h);

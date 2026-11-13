@@ -6,9 +6,11 @@
 #include <chrono>
 #include <cstdio>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "test_util.hpp"
+#include "prefix_fabric/coordinator.hpp"
 #include "prefix_fabric/net.hpp"
 #include "prefix_fabric/protocol.hpp"
 
@@ -128,6 +130,66 @@ PF_TEST(MultiProcess_CoordinatorNodes) {
   CHECK(RunSync(pubcmd3, 15000, pub3, rc)); CHECK(pub3.find("PUBLISHED") != std::string::npos);
   TerminateProcess(hcoord2, 0);
   CloseHandle(rp2); CloseHandle(hcoord2);
+}
+
+PF_TEST(Coordinator_FrameBoundIsTheConfiguredOne) {
+  PrefixCoordinator::Options co; co.ns = "dist"; co.listen_port = 0;
+  co.capacity = CapacityPolicy::Defaults(); co.capacity.max_network_frame_bytes = 1024;
+  PrefixCoordinator coord(co);
+  auto port = coord.Start();
+  CHECK(port.is_ok());
+  if (!port.is_ok()) return;
+  TcpConnection c;
+  CHECK(c.Connect("127.0.0.1", port.value(), 5000).is_ok());
+  CHECK(c.SendFrame(proto::Encode(proto::MT_REGISTER, proto::BuildRegister("boot-1", "n1"))).is_ok());
+  CHECK(c.RecvFrame(1 << 20).is_ok());
+  // A frame four times the configured bound is not read: the connection is dropped
+  // and nothing is published.
+  CompatibilityKey k; k.model = "m"; k.tokenizer = "t";
+  const TokenSequence big(1024, 7);
+  (void)c.SendFrame(proto::Encode(proto::MT_PUBLISH, proto::BuildPublish("boot-1", k, big, {}, "")));
+  CHECK(c.RecvFrame(1 << 20).is_err());
+  CHECK_EQ(coord.Store().PrefixCount(), 0u);
+  coord.Stop();
+}
+
+PF_TEST(Coordinator_StopLeavesOtherSocketsAlone) {
+  // Connections that came and went must not make Stop() touch sockets the process
+  // opened afterwards (a handle value is handed out again once it is closed).
+  PrefixCoordinator::Options co; co.ns = "dist"; co.listen_port = 0;
+  PrefixCoordinator coord(co);
+  auto port = coord.Start();
+  CHECK(port.is_ok());
+  if (!port.is_ok()) return;
+  for (int i = 0; i < 16; ++i) {
+    TcpConnection c;
+    CHECK(c.Connect("127.0.0.1", port.value(), 5000).is_ok());
+    CHECK(c.SendFrame(proto::Encode(proto::MT_REGISTER, proto::BuildRegister("boot-" + std::to_string(i), "n"))).is_ok());
+    CHECK(c.RecvFrame(1 << 20).is_ok());
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));  // let the coordinator close its ends
+  TcpListener other;
+  auto oport = other.Listen("127.0.0.1", 0);
+  CHECK(oport.is_ok());
+  if (!oport.is_ok()) { coord.Stop(); return; }
+  std::vector<TcpConnection> mine(16), theirs;
+  for (auto& m : mine) {
+    CHECK(m.Connect("127.0.0.1", oport.value(), 5000).is_ok());
+    auto a = other.Accept();
+    CHECK(a.is_ok());
+    if (a.is_ok()) theirs.push_back(std::move(a.value()));
+  }
+  coord.Stop();
+  bool all = theirs.size() == mine.size();
+  for (std::size_t i = 0; i < theirs.size(); ++i) {
+    if (!mine[i].SendFrame("ping").is_ok()) all = false;
+    auto got = theirs[i].RecvFrame(64);
+    if (!got.is_ok() || got.value() != "ping") all = false;
+    if (!theirs[i].SendFrame("pong").is_ok()) all = false;
+    auto back = mine[i].RecvFrame(64);
+    if (!back.is_ok() || back.value() != "pong") all = false;
+  }
+  CHECK(all);
 }
 
 int main() { return pftest::RunAll(); }

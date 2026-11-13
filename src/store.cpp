@@ -58,7 +58,8 @@ struct PrefixStore::Impl {
     icfg.eviction = o.eviction;
     index = std::make_unique<PrefixIndex>(icfg);
     hub = std::make_unique<Hub>();
-    hub->max_backlog = o.max_event_backlog ? o.max_event_backlog : o.capacity.max_event_backlog;
+    // The index holds the effective policy (unset bounds replaced by the defaults).
+    hub->max_backlog = o.max_event_backlog ? o.max_event_backlog : index->Capacity().max_event_backlog;
   }
 
   void Emit(EventType type, const PrefixId& id, std::string detail) {
@@ -70,7 +71,7 @@ struct PrefixStore::Impl {
     ev.timestamp_ns = static_cast<std::int64_t>(hub->seq);
     ev.id = id;
     ev.detail = std::move(detail);
-    if (hub->queue.size() >= hub->max_backlog) hub->queue.pop_front();
+    if (!hub->queue.empty() && hub->queue.size() >= hub->max_backlog) hub->queue.pop_front();
     hub->queue.push_back(std::move(ev));
     hub->cv.notify_one();
   }
@@ -331,12 +332,14 @@ Result<void> PrefixStore::SaveToFile(const std::string& path) {
   // Serialize the index and write atomically. Implementation in persist.cpp is
   // wired via PrefixIndex::SerializeBinary here for now.
   std::string blob = impl_->index->SerializeBinary();
+  if (blob.size() > impl_->index->Capacity().max_serialized_object_bytes)
+    return Result<void>::Err(Error{ErrorCode::kCapacityExceeded, "serialized index exceeds max_serialized_object_bytes"});
   auto r = pf_internal::WriteFileAtomic(path, blob);
   return r;
 }
 Result<std::size_t> PrefixStore::LoadFromFile(const std::string& path) {
   std::string blob;
-  auto r = pf_internal::ReadFile(path, blob);
+  auto r = pf_internal::ReadFile(path, blob, impl_->index->Capacity().max_serialized_object_bytes);
   if (r.is_err()) return Result<std::size_t>::Err(r.error());
   std::string detail;
   auto res = impl_->index->DeserializeBinary(blob, &detail);
@@ -349,7 +352,7 @@ Result<PrefixStore::SubscriptionHandle> PrefixStore::Subscribe(
   if (!cb) return Result<SubscriptionHandle>::Err(Error{ErrorCode::kInvalidArgument, "null callback"});
   auto& h = impl_->hub;
   std::lock_guard<std::mutex> lk(h->mtx);
-  if (h->subs.size() >= impl_->opts.capacity.max_subscriptions)
+  if (h->subs.size() >= impl_->index->Capacity().max_subscriptions)
     return Result<SubscriptionHandle>::Err(Error{ErrorCode::kCapacityExceeded, "subscription limit"});
   PrefixSubscription s;
   s.id = h->next_sub++;

@@ -106,4 +106,52 @@ PF_TEST(Property_BoundedCapacityEviction) {
   CHECK(store.PrefixCount() > 0);
 }
 
+PF_TEST(Property_CountersMatchARecount) {
+  // Whatever was done to a store, its running counters equal a count taken from
+  // scratch. Loading a saved copy counts from scratch.
+  std::mt19937 rng(4242);
+  CompatibilityKey ca = CompatA(), cb = CompatB();
+  PrefixStore::Options o; o.ns = "prop"; o.default_compat = ca;
+  o.segmentation.policy = SegmentationPolicy::kFixed; o.segmentation.fixed_size = 3;
+  o.capacity = CapacityPolicy::Defaults(); o.eviction.auto_evict = false;
+  PrefixStore store(o);
+  std::vector<PrefixId> ids;
+  const std::string path = "prop_recount.bin";
+  auto some_ref = [&]() {
+    StateReference r; r.ns = "kv"; r.object_id = "o" + std::to_string(rng() % 40); r.generation = 1 + (rng() % 3);
+    return r;
+  };
+  for (int step = 0; step < 1500; ++step) {
+    const CompatibilityKey& c = (rng() % 4 == 0) ? cb : ca;
+    const int op = static_cast<int>(rng() % 10);
+    if (op < 5 || ids.empty()) {
+      TokenSequence t; int len = 1 + static_cast<int>(rng() % 7); for (int j = 0; j < len; ++j) t.push_back(1 + (rng() % 5));
+      std::vector<StateReference> refs;
+      if (rng() % 3 == 0) refs.push_back(some_ref());
+      auto r = store.Add(c, t, refs);
+      CHECK(r.is_ok());
+      if (r.is_ok()) ids.push_back(r.value().id);
+    } else {
+      const PrefixId id = ids[rng() % ids.size()];
+      if (op == 5) store.AttachState(id, some_ref());
+      else if (op == 6) store.RetireState(id, some_ref());
+      else if (op == 7) store.Invalidate(id, rng() % 2 == 0);
+      else if (op == 8) store.Remove(id, rng() % 2 == 0);
+      else store.Evict(1 + (rng() % 2));
+    }
+    if (step % 250 == 249) {
+      CHECK(store.SaveToFile(path).is_ok());
+      PrefixStore recount(o);
+      CHECK(recount.LoadFromFile(path).is_ok());
+      CHECK_EQ(store.PrefixCount(), recount.PrefixCount());
+      CHECK_EQ(store.NodeCount(), recount.NodeCount());
+      CHECK_EQ(store.SegmentCount(), recount.SegmentCount());
+      CHECK_EQ(store.ReferenceCount(), recount.ReferenceCount());
+      CHECK_EQ(store.PrefixTokens(), recount.PrefixTokens());
+      CHECK_EQ(store.TokenFootprintBytes(), recount.TokenFootprintBytes());
+    }
+  }
+  std::remove(path.c_str());
+}
+
 int main() { return pftest::RunAll(); }
